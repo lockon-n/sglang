@@ -78,6 +78,10 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     encode_reasoning_state,
     label_developer_content,
 )
+from sglang.srt.entrypoints.openai.responses_sessions import (
+    ResponsesSessionManager,
+    SessionTurn,
+)
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
@@ -206,6 +210,14 @@ class OpenAIServingResponses(OpenAIServingChat):
         self.background_tasks: dict[str, asyncio.Task] = {}
         self.enable_response_store = get_serving().enable_response_store
         self.is_disaggregated = get_disagg().disaggregation_mode != "null"
+        self.session_manager: Optional[ResponsesSessionManager] = (
+            ResponsesSessionManager(
+                tokenizer_manager=tokenizer_manager,
+                idle_timeout=get_serving().responses_streaming_session_timeout,
+            )
+            if get_serving().enable_responses_streaming_session and not self.use_harmony
+            else None
+        )
 
     @staticmethod
     def _has_response_tool(request: ResponsesRequest, *tool_types: str) -> bool:
@@ -503,8 +515,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         context = SimpleContext()
 
+                    session_turn = await self._begin_session_turn(
+                        request, engine_prompt, processed_messages
+                    )
+
                     # Create GenerateReqInput for SGLang
-                    if isinstance(engine_prompt, str):
+                    if session_turn is not None:
+                        prompt_kwargs = {"text": session_turn.text}
+                    elif isinstance(engine_prompt, str):
                         prompt_kwargs = {"text": engine_prompt}
                     else:
                         prompt_kwargs = {"input_ids": engine_prompt}
@@ -528,9 +546,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                         **prompt_kwargs,
                         **logprob_kwargs,
                         image_data=(
-                            processed_messages.image_data
-                            if processed_messages
-                            else None
+                            session_turn.image_data
+                            if session_turn is not None
+                            else (
+                                processed_messages.image_data
+                                if processed_messages
+                                else None
+                            )
                         ),
                         video_data=(
                             processed_messages.video_data
@@ -543,14 +565,23 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                         modalities=(
-                            processed_messages.modalities
-                            if processed_messages
-                            else None
+                            session_turn.modalities
+                            if session_turn is not None
+                            else (
+                                processed_messages.modalities
+                                if processed_messages
+                                else None
+                            )
                         ),
                         sampling_params=sampling_params,
                         stream=request.stream,
                         rid=request.request_id,
                         session_id=request.session_id,
+                        session_params=(
+                            {"id": session_turn.session_id}
+                            if session_turn is not None
+                            else None
+                        ),
                         extra_key=request.extra_key,
                         cache_salt=request.cache_salt,
                         bootstrap_host=request.bootstrap_host,
@@ -572,6 +603,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                         raw_request=raw_request,
                         priority=request.priority,
                     )
+                    if session_turn is not None:
+                        generator = self.session_manager.track(
+                            turn=session_turn,
+                            response_id=request.request_id,
+                            generator=generator,
+                            incremental_output=request.stream
+                            and self.tokenizer_manager.incremental_streaming_output,
+                        )
                     generators.append(generator)
             except ValueError as e:
                 return self.create_error_response(str(e))
@@ -664,6 +703,31 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return self.create_error_response(str(e))
         return self.create_error_response("Unknown error")
 
+    async def _begin_session_turn(
+        self,
+        request: ResponsesRequest,
+        engine_prompt: Any,
+        processed_messages: Optional[MessageProcessingResult],
+    ) -> Optional[SessionTurn]:
+        """Route a stored, text-prompted turn through its chain's streaming session."""
+        if (
+            self.session_manager is None
+            or not request.store
+            or request.background
+            or request.session_id is not None
+            or not isinstance(engine_prompt, str)
+            or processed_messages is None
+            or processed_messages.video_data
+            or processed_messages.audio_data
+        ):
+            return None
+        return await self.session_manager.begin_turn(
+            previous_response_id=request.previous_response_id,
+            prompt=engine_prompt,
+            image_data=processed_messages.image_data,
+            modalities=processed_messages.modalities,
+        )
+
     async def _make_request(
         self,
         request: ResponsesRequest,
@@ -725,9 +789,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             requirement = (
                 "restrict the recipient to the named tool"
                 if isinstance(tool_choice, dict)
-                else "require a tool recipient"
-                if tool_choice == "required"
-                else "exclude tool recipients"
+                else (
+                    "require a tool recipient"
+                    if tool_choice == "required"
+                    else "exclude tool recipients"
+                )
             )
             raise ValueError(
                 f"Harmony tool_choice={request.tool_choice!r} cannot {requirement}: "
@@ -1383,9 +1449,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                 and merged
                 and isinstance(merged[-1], dict)
                 and merged[-1].get("role") == "assistant"
-                and merged[-1].get("phase") == msg.get("phase")
+                and (
+                    merged[-1].get("phase") == msg.get("phase")
+                    # A replayed reasoning item has no phase and opens the
+                    # message after it, so it takes that message's phase.
+                    or merged[-1].keys() <= {"role", "reasoning_content"}
+                )
             ):
                 prev = merged[-1] = dict(merged[-1])
+                if msg.get("phase") is not None:
+                    prev["phase"] = msg["phase"]
                 # Lift mixed str/list content to list parts so non-text parts
                 # (e.g. image_url) survive when the two sides differ in shape.
                 new_content = msg.get("content")
@@ -1726,9 +1799,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 event_prefix = (
                     "response.reasoning_summary_text"
                     if is_summary
-                    else "response.output_text"
-                    if item.type == "message"
-                    else "response.reasoning_text"
+                    else (
+                        "response.output_text"
+                        if item.type == "message"
+                        else "response.reasoning_text"
+                    )
                 )
                 index_key = "summary_index" if is_summary else "content_index"
                 part_prefix = (

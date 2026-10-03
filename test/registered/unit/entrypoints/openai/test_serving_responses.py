@@ -291,6 +291,29 @@ class InputMessageConstructionTestCase(CustomTestCase):
         self.assertEqual([m["phase"] for m in messages], ["commentary", "final_answer"])
         self.assertEqual([m["content"] for m in messages], ["working", "answer"])
 
+    def test_replay_merges_reasoning_into_the_phased_message_after_it(self):
+        # A stored thinking turn must replay as the single assistant block the
+        # model generated, not as a reasoning-only block plus an answer block.
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {"role": "user", "content": "q"},
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "think"}],
+                },
+                {"role": "assistant", "content": "answer", "phase": "final_answer"},
+            ],
+            store=False,
+        )
+        messages = serving._construct_input_messages(request)
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[1]["reasoning_content"], "think")
+        self.assertEqual(messages[1]["content"], "answer")
+        self.assertEqual(messages[1]["phase"], "final_answer")
+
     def test_input_parts_normalized_for_chat_templates(self):
         serving = make_serving()
         request = ResponsesRequest(

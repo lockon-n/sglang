@@ -33,6 +33,13 @@ def validate_response_store(server_args: Any) -> None:
             "--disaggregation-mode=prefill or decode; response storage must "
             "remain disabled in PD mode."
         )
+    if cfg.enable_responses_streaming_session and not (
+        cfg.enable_response_store and cfg.enable_streaming_session
+    ):
+        raise ValueError(
+            "--enable-responses-streaming-session requires --enable-response-store "
+            "and --enable-streaming-session."
+        )
 
 
 def check_pipeline_parallel_compat(cfg: Any) -> None:

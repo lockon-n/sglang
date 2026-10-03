@@ -29,6 +29,18 @@ class Serving(msgspec.Struct):
         "requests. Disabled by default; unsupported with prefill-decode "
         "disaggregation. Storage has no TTL or size limit.",
     ] = False
+    enable_responses_streaming_session: A[
+        bool,
+        "Serve each previous_response_id chain from a streaming session, so a "
+        "turn only tokenizes and ships its new suffix and media instead of "
+        "re-preprocessing the whole history. Requires --enable-response-store "
+        "and --enable-streaming-session.",
+    ] = False
+    responses_streaming_session_timeout: A[
+        float,
+        "Idle seconds after which a Responses chain's streaming session and "
+        "its KV are released; the next turn of that chain starts a new session.",
+    ] = 300.0
     tokenizer_path: A[Optional[str], "The path of the tokenizer."] = None
     tokenizer_mode: A[
         str,

@@ -428,6 +428,8 @@ class GenerateReqInput:
         self._determine_batch_size()
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
+        if self.session_params is not None:
+            self._validate_session_params()
         self._handle_parallel_sampling()
 
         if self.is_single:
@@ -436,6 +438,16 @@ class GenerateReqInput:
             self._normalize_batch_inputs()
 
         self._validate_rid_uniqueness()
+
+    def _validate_session_params(self):
+        # The scheduler keys its session table on these; an unhashable id
+        # raises inside the scheduler loop and takes the whole server down.
+        if not isinstance(self.session_params, dict):
+            raise ValueError("session_params must be an object.")
+        for key in ("id", "rid"):
+            value = self.session_params.get(key)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"session_params.{key} must be a string.")
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
