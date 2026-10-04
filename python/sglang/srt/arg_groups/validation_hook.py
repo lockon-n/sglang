@@ -40,6 +40,17 @@ def validate_response_store(server_args: Any) -> None:
             "--enable-responses-streaming-session requires --enable-response-store "
             "and --enable-streaming-session."
         )
+    if (
+        cfg.enable_responses_sparse_blocks or cfg.responses_sparse_blocks_config
+    ) and not cfg.enable_responses_streaming_session:
+        raise ValueError(
+            "--enable-responses-sparse-blocks and --responses-sparse-blocks-config "
+            "require --enable-responses-streaming-session."
+        )
+    if cfg.responses_sparse_blocks_config:
+        from sglang.srt.multimodal.sparse_blocks import SparseBlockConfig
+
+        SparseBlockConfig.from_json(cfg.responses_sparse_blocks_config)
 
 
 def check_pipeline_parallel_compat(cfg: Any) -> None:

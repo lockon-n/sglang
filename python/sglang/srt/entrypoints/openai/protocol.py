@@ -1817,6 +1817,13 @@ class ResponsesRequest(BaseModel):
 
     # Extra SGLang parameters
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    sparse_blocks: Optional[Union[bool, Dict[str, Any]]] = Field(
+        default=None,
+        description="Encode this chain's images as changed blocks against the "
+        "previous image: true for the server defaults, or an object overriding "
+        'SparseBlockConfig fields (e.g. {"p_frame_pair": "current"}). Needs '
+        "--enable-responses-sparse-blocks; set when the chain's session opens.",
+    )
     request_id: str = Field(
         default_factory=lambda: f"resp_{uuid.uuid4().hex}",
         description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",

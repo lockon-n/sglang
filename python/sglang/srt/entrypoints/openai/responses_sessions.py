@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional, Union
 
 import msgspec
 
@@ -38,6 +38,8 @@ class _ChainHead(msgspec.Struct, frozen=True, kw_only=True):
     # Identity of each image already inside the session, in prompt order.
     media_keys: tuple
     started_at: float
+    # Sparse-block config the session was opened with, or None for dense.
+    sparse_blocks: Any = None
 
 
 class SessionTurn(msgspec.Struct, kw_only=True):
@@ -50,6 +52,7 @@ class SessionTurn(msgspec.Struct, kw_only=True):
     media_keys: tuple
     started_at: float
     output_ids: list = []
+    sparse_blocks: Any = None
 
 
 def _media_key(item: Any) -> Optional[tuple]:
@@ -82,8 +85,10 @@ class ResponsesSessionManager:
         prompt: str,
         image_data: Optional[list],
         modalities: Optional[list],
+        sparse_blocks: Union[bool, dict, None] = None,
     ) -> Optional[SessionTurn]:
         """Plan one turn, or return None to serve it without a session."""
+        sparse_config = self._sparse_config(sparse_blocks)
         now = time.monotonic()
         self._expire(now=now)
         images = list(image_data or [])
@@ -94,7 +99,7 @@ class ResponsesSessionManager:
             return None
 
         head = self._heads.pop(previous_response_id, None)
-        if head is not None:
+        if head is not None and head.sparse_blocks == sparse_config:
             delta_turn = self._delta_turn(
                 head=head,
                 prompt=prompt,
@@ -109,9 +114,10 @@ class ResponsesSessionManager:
                 "Responses chain %s diverged from its session; reopening",
                 previous_response_id,
             )
+        if head is not None:
             self._close(head.session_id)
 
-        session_id = await self._open(prompt_len=len(prompt))
+        session_id = await self._open(prompt_len=len(prompt), sparse=sparse_config)
         if session_id is None:
             return None
         return SessionTurn(
@@ -122,6 +128,7 @@ class ResponsesSessionManager:
             full_prompt=prompt,
             media_keys=media_keys,
             started_at=now,
+            sparse_blocks=sparse_config,
         )
 
     async def track(
@@ -153,6 +160,8 @@ class ResponsesSessionManager:
                 and finish_reason["type"] != "abort"
             ):
                 self._heads[response_id] = self._advance_head(turn)
+                if (sparse_blocks := self._sparse_blocks()) is not None:
+                    sparse_blocks.commit(turn.session_id)
             else:
                 self._close(turn.session_id)
 
@@ -181,6 +190,7 @@ class ResponsesSessionManager:
             full_prompt=prompt,
             media_keys=media_keys,
             started_at=now,
+            sparse_blocks=head.sparse_blocks,
         )
 
     def _advance_head(self, turn: SessionTurn) -> _ChainHead:
@@ -193,11 +203,12 @@ class ResponsesSessionManager:
             text=turn.full_prompt + generated,
             media_keys=turn.media_keys,
             started_at=turn.started_at,
+            sparse_blocks=turn.sparse_blocks,
         )
 
-    async def _open(self, *, prompt_len: int) -> Optional[str]:
+    async def _open(self, *, prompt_len: int, sparse: Any = None) -> Optional[str]:
         try:
-            return await self._tokenizer_manager.open_session(
+            session_id = await self._tokenizer_manager.open_session(
                 OpenSessionReqInput(
                     capacity_of_str_len=prompt_len,
                     streaming=True,
@@ -207,6 +218,26 @@ class ResponsesSessionManager:
         except Exception:
             logger.exception("Failed to open a streaming session for Responses")
             return None
+        if session_id is not None and sparse is not None:
+            self._sparse_blocks().open(session_id, sparse)
+        return session_id
+
+    def _sparse_config(self, request: Union[bool, dict, None]):
+        """The chain config a request's ``sparse_blocks`` asks for, or None."""
+        if request is None or request is False:
+            return None
+        sparse_blocks = self._sparse_blocks()
+        if sparse_blocks is None:
+            raise ValueError(
+                "sparse_blocks needs a Qwen3.5 server started with "
+                "--enable-responses-sparse-blocks."
+            )
+        return sparse_blocks.config_for(request)
+
+    def _sparse_blocks(self):
+        """The chain image state of --enable-responses-sparse-blocks, if on."""
+        mm_processor = getattr(self._tokenizer_manager, "mm_processor", None)
+        return getattr(mm_processor, "sparse_blocks", None)
 
     def _expire(self, *, now: float) -> None:
         deadline = self._idle_timeout * _EXPIRY_MARGIN
@@ -216,6 +247,8 @@ class ResponsesSessionManager:
                 self._close(head.session_id)
 
     def _close(self, session_id: str) -> None:
+        if (sparse_blocks := self._sparse_blocks()) is not None:
+            sparse_blocks.close(session_id)
         task = asyncio.create_task(
             self._tokenizer_manager.close_session(
                 CloseSessionReqInput(session_id=session_id)

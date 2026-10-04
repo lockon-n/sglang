@@ -41,6 +41,19 @@ class Serving(msgspec.Struct):
         "Idle seconds after which a Responses chain's streaming session and "
         "its KV are released; the next turn of that chain starts a new session.",
     ] = 300.0
+    enable_responses_sparse_blocks: A[
+        bool,
+        "Allow Responses requests on Qwen3.5 to set sparse_blocks: their chain "
+        "encodes each new image against the previous one and sends only the "
+        "changed 32x32 blocks through the vision encoder. Requires "
+        "--enable-responses-streaming-session.",
+    ] = False
+    responses_sparse_blocks_config: A[
+        Optional[str],
+        "JSON defaults for sparse-block selection that requests start from, e.g. "
+        '\'{"p_frame_pair": "current", "budgets": [16, 32, 64]}\'. '
+        "See SparseBlockConfig for the fields.",
+    ] = None
     tokenizer_path: A[Optional[str], "The path of the tokenizer."] = None
     tokenizer_mode: A[
         str,

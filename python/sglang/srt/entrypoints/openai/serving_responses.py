@@ -720,12 +720,18 @@ class OpenAIServingResponses(OpenAIServingChat):
             or processed_messages.video_data
             or processed_messages.audio_data
         ):
+            if request.sparse_blocks:
+                raise ValueError(
+                    "sparse_blocks needs --enable-responses-streaming-session, "
+                    "store=true, no background mode and no video or audio."
+                )
             return None
         return await self.session_manager.begin_turn(
             previous_response_id=request.previous_response_id,
             prompt=engine_prompt,
             image_data=processed_messages.image_data,
             modalities=processed_messages.modalities,
+            sparse_blocks=request.sparse_blocks,
         )
 
     async def _make_request(

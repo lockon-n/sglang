@@ -4,7 +4,7 @@ import re
 import time
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any, List, Optional, Union
 
 import numpy as np
@@ -13,6 +13,9 @@ import torchvision
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 from transformers import BaseImageProcessor
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import (
+    smart_resize as qwen2_vl_smart_resize,
+)
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
@@ -48,10 +51,17 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.sparse_blocks import (
+    SPARSE_GRID_KEY,
+    SPARSE_INDEX_KEY,
+    SparseBlockConfig,
+    SparseBlockEncoder,
+    sparse_item_hash,
+)
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
-from sglang.srt.runtime_context import get_mm, get_parallel
+from sglang.srt.runtime_context import get_mm, get_parallel, get_serving
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
@@ -404,6 +414,44 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             video_token_id=self.VIDEO_TOKEN_ID,
             audio_token_id=self.audio_token_id,
         ).build(_processor)
+        self.sparse_blocks = self._init_sparse_blocks()
+
+    def _init_sparse_blocks(self) -> Optional[SparseBlockEncoder]:
+        serving = get_serving()
+        if not serving.enable_responses_sparse_blocks:
+            return None
+        if self.model_type not in ("qwen3_5", "qwen3_5_moe"):
+            raise ValueError(
+                "--enable-responses-sparse-blocks supports Qwen3.5 models only."
+            )
+        vision = self.hf_config.vision_config
+        if (
+            vision.patch_size,
+            vision.temporal_patch_size,
+            vision.spatial_merge_size,
+        ) != (16, 2, 2) or getattr(vision, "deepstack_visual_indexes", None):
+            raise ValueError(
+                "Sparse blocks need patch 16, temporal patch 2, merge 2 and no "
+                "deepstack layers."
+            )
+        if get_mm().mm_enable_dp_encoder or envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+            raise ValueError(
+                "Sparse blocks do not support the DP vision encoder or ViT CUDA graphs."
+            )
+        image_processor = self._processor.image_processor
+        size = image_processor.size
+        size_of = size.get if isinstance(size, dict) else partial(getattr, size)
+        self._sparse_min_pixels = getattr(
+            image_processor, "min_pixels", None
+        ) or size_of("shortest_edge")
+        self._sparse_max_pixels = getattr(
+            image_processor, "max_pixels", None
+        ) or size_of("longest_edge")
+        return SparseBlockEncoder(
+            SparseBlockConfig.from_json(serving.responses_sparse_blocks_config),
+            image_processor.image_mean,
+            image_processor.image_std,
+        )
 
     @property
     def spatial_merge_size(self):
@@ -1180,6 +1228,16 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
+        session_id = (getattr(request_obj, "session_params", None) or {}).get("id")
+        if (
+            self.sparse_blocks is not None
+            and self.sparse_blocks.is_open(session_id)
+            and image_data
+            and not request_obj.video_data
+            and not request_obj.audio_data
+            and not any(self._is_preprocessed_input(item) for item in image_data)
+        ):
+            return await self._process_sparse_blocks(image_data, input_text, session_id)
         if (
             not image_data
             or request_obj.video_data
@@ -1208,6 +1266,131 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         return await self._process_mm_data_uncached(
             image_data, input_text, request_obj, *args, **kwargs
         )
+
+    async def _process_sparse_blocks(self, image_data, input_text, session_id):
+        """Encode a chain turn's images as changed blocks against the chain."""
+        base_output = await self.load_mm_data(
+            prompt=input_text,
+            image_data=image_data,
+            multimodal_tokens=self.mm_tokens,
+        )
+        frames = self.sparse_blocks.encode(
+            session_id,
+            [self._sparse_resized_rgb(image) for image in base_output.images],
+        )
+        text_parts = self.mm_tokens.image_token_regex.split(base_output.input_text)
+        if len(text_parts) != len(frames) + 1:
+            raise ValueError(
+                f"Expected {len(frames)} image placeholders, found {len(text_parts) - 1}."
+            )
+        # An unchanged image contributes no tokens at all.
+        prompt = text_parts[0]
+        for frame, text in zip(frames, text_parts[1:]):
+            if frame.num_tokens:
+                prompt += (
+                    "<|vision_start|>"
+                    + "<|image_pad|>" * frame.num_tokens
+                    + "<|vision_end|>"
+                )
+            prompt += text
+        input_ids = self._tokenizer.encode(prompt)
+
+        runs, start = [], None
+        for i, token in enumerate(input_ids + [None]):
+            if token == self.IM_TOKEN_ID and start is None:
+                start = i
+            elif token != self.IM_TOKEN_ID and start is not None:
+                runs.append((start, i - 1))
+                start = None
+        kept = [frame for frame in frames if frame.num_tokens]
+        if [end - start + 1 for start, end in runs] != [f.num_tokens for f in kept]:
+            raise ValueError("Sparse image placeholders do not match the kept blocks.")
+
+        mm_items = []
+        for frame, offsets in zip(kept, runs):
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=frame.pixel_rows,
+                offsets=[offsets],
+                model_specific_data={
+                    SPARSE_GRID_KEY: torch.tensor(frame.grid, dtype=torch.long),
+                    SPARSE_INDEX_KEY: frame.block_index,
+                },
+            )
+            item.set_hash(
+                sparse_item_hash(frame.pixel_rows, frame.grid, frame.block_index)
+            )
+            mm_items.append(item)
+
+        mrope_positions, mrope_position_delta = self._sparse_mrope_positions(
+            len(input_ids), kept, runs
+        )
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            padded_input_ids=MultimodalProcessorOutput.build_padded_input_ids(
+                input_ids, mm_items
+            ),
+            mm_items=mm_items,
+            im_start_id=self.vision_start_token_id,
+            im_end_id=self.vision_end_token_id,
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            audio_token_id=self.mm_tokens.audio_token_id,
+            mrope_positions=mrope_positions,
+            mrope_position_delta=mrope_position_delta,
+        )
+
+    def _sparse_resized_rgb(self, image) -> torch.Tensor:
+        """The image resized to the native 32-aligned grid, RGB in [0, 1]."""
+        if isinstance(image, Image.Image):
+            image = torchvision.transforms.functional.pil_to_tensor(
+                image.convert("RGB")
+            )
+        if image.shape[0] == 1:
+            image = image.expand(3, -1, -1)
+        image = image[:3]
+        device = self._fast_image_processor_device(self._processor)
+        if device is not None:
+            image = image.to(device)
+        height, width = image.shape[-2:]
+        resized = qwen2_vl_smart_resize(
+            height,
+            width,
+            factor=self.hf_config.vision_config.patch_size * self._spatial_merge_size,
+            min_pixels=self._sparse_min_pixels,
+            max_pixels=self._sparse_max_pixels,
+        )
+        rgb = image.float()[None] / 255
+        if tuple(resized) != (height, width):
+            rgb = torch.nn.functional.interpolate(
+                rgb, size=resized, mode="bicubic", antialias=True, align_corners=False
+            )
+        return rgb[0].clamp_(0, 1)
+
+    def _sparse_mrope_positions(self, input_len, frames, runs):
+        """Text advances by one; a sparse image puts each block at its (row, col).
+
+        Same layout as a dense image (t=0), only at the kept blocks, and the
+        image advances the text position by the extent of its full block grid.
+        """
+        segments, next_pos, cursor = [], 0, 0
+        for frame, (start, end) in zip(frames, runs):
+            if start > cursor:
+                segments.append(torch.arange(start - cursor).expand(3, -1) + next_pos)
+                next_pos += start - cursor
+            cols = frame.grid[1] // self._spatial_merge_size
+            rows = frame.grid[0] // self._spatial_merge_size
+            index = frame.block_index
+            segments.append(
+                torch.stack((torch.zeros_like(index), index // cols, index % cols))
+                + next_pos
+            )
+            next_pos += max(1, rows, cols)
+            cursor = end + 1
+        if cursor < input_len:
+            segments.append(torch.arange(input_len - cursor).expand(3, -1) + next_pos)
+        positions = torch.cat(segments, dim=1)
+        return positions, (positions.max() + 1 - input_len).reshape(1, 1)
 
     def _mark_cuda_ipc_features_for_deferred_reconstruction(self, mm_items):
         supports_deferred_reconstruction = get_mm().mm_enable_dp_encoder or (

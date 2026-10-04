@@ -14,6 +14,7 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 
+import itertools
 import logging
 import re
 from array import array
@@ -73,6 +74,11 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
+)
+from sglang.srt.multimodal.sparse_blocks import (
+    SPARSE_GRID_KEY,
+    SPARSE_INDEX_KEY,
+    sparse_patch_coordinates,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
     BORROW_CUDA_IPC_FEATURE_KEY,
@@ -958,7 +964,89 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         token_cu_seqlens = np.concatenate(
             [np.zeros(1, dtype=np.int32), token_cu_seqlens]
         )
+        return self._forward_blocks(
+            x, rotary_pos_emb_cos, rotary_pos_emb_sin, token_cu_seqlens
+        )
 
+    def forward_sparse(
+        self,
+        x: torch.Tensor,
+        grids: list[tuple[int, int]],
+        block_indices: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Encode images given only some of their 2x2-patch blocks.
+
+        ``x`` holds four patch rows per kept block (2x2 row-major), image after
+        image. Each image is ``grids[i]`` = (patch rows, patch cols) with kept
+        blocks ``block_indices[i]`` (row-major over the merged grid). Position
+        embeddings and rotary use each patch's coordinates in its full grid, so
+        keeping every block equals the dense forward.
+        """
+        x = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
+        x = self.patch_embed(x)
+        coordinates = [
+            sparse_patch_coordinates(index.to(self.device), cols)
+            for (_, cols), index in zip(grids, block_indices)
+        ]
+        x += torch.cat(
+            [
+                self._sparse_pos_embed(coords, rows, cols)
+                for coords, (rows, cols) in zip(coordinates, grids)
+            ]
+        )
+        cos, sin = self.rotary_pos_emb.get_cos_sin(max(max(g) for g in grids))
+        coordinates = torch.cat(coordinates)
+        token_cu_seqlens = np.concatenate(
+            [[0], np.cumsum([4 * len(index) for index in block_indices])]
+        ).astype(np.int32)
+        return self._forward_blocks(
+            x,
+            cos[coordinates].flatten(1),
+            sin[coordinates].flatten(1),
+            token_cu_seqlens,
+        )
+
+    def _sparse_pos_embed(
+        self, coordinates: torch.Tensor, rows: int, cols: int
+    ) -> torch.Tensor:
+        """``fast_pos_embed_interpolate_from_list`` evaluated at given patches."""
+        side = self.num_grid_per_side
+        h_idxs = torch.linspace(
+            0, side - 1, rows, dtype=torch.float32, device=self.device
+        )[coordinates[:, 0]]
+        w_idxs = torch.linspace(
+            0, side - 1, cols, dtype=torch.float32, device=self.device
+        )[coordinates[:, 1]]
+        h_floor = h_idxs.to(torch.long)
+        w_floor = w_idxs.to(torch.long)
+        h_ceil = torch.clamp(h_floor + 1, max=side - 1)
+        w_ceil = torch.clamp(w_floor + 1, max=side - 1)
+        dh = h_idxs - h_floor
+        dw = w_idxs - w_floor
+        w11 = dh * dw
+        w10 = dh - w11
+        w01 = dw - w11
+        w00 = 1 - dh - w01
+        indices = torch.stack(
+            [
+                h_floor * side + w_floor,
+                h_floor * side + w_ceil,
+                h_ceil * side + w_floor,
+                h_ceil * side + w_ceil,
+            ]
+        )
+        weights = torch.stack([w00, w01, w10, w11]).unsqueeze(-1).to(self.dtype)
+        embeds = self.pos_embed(indices)
+        embeds *= weights
+        return embeds.sum(dim=0)
+
+    def _forward_blocks(
+        self,
+        x: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        token_cu_seqlens: np.ndarray,
+    ) -> torch.Tensor:
         # ---- pre-compute attention metadata once for all layers ----
         packed_indptrs = None
         flashinfer_sequence_lengths = None
@@ -1430,8 +1518,36 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         _require_vision(self)
+        sparse = [SPARSE_INDEX_KEY in item.model_specific_data for item in items]
+        if any(sparse):
+            # Keep item order: encode each run of sparse or dense items in turn.
+            features = []
+            for is_sparse, run in itertools.groupby(
+                zip(sparse, items), key=lambda pair: pair[0]
+            ):
+                run = [item for _, item in run]
+                features.append(
+                    self._get_sparse_image_feature(run)
+                    if is_sparse
+                    else self.get_image_feature(run)
+                )
+            return torch.cat(features)
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         return self._get_visual_feature(items, image_grid_thw)
+
+    def _get_sparse_image_feature(
+        self, items: List[MultimodalDataItem]
+    ) -> torch.Tensor:
+        """Images encoded from kept blocks only (--enable-responses-sparse-blocks)."""
+        pixel_values = self._materialize_visual_items(items, range(len(items)))
+        return self.visual.forward_sparse(
+            pixel_values,
+            [
+                tuple(item.model_specific_data[SPARSE_GRID_KEY].tolist())
+                for item in items
+            ],
+            [item.model_specific_data[SPARSE_INDEX_KEY] for item in items],
+        )
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         _require_vision(self)
