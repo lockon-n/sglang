@@ -3651,6 +3651,40 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(_step3p_overrides(_args(), None), {})
 
 
+class TestDefaultAttnBackendSpeculative(CustomTestCase):
+    def _backend(self, **kw):
+        args = dict(
+            speculative_algorithm=None, speculative_eagle_topk=None, page_size=None
+        )
+        args.update(kw)
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["Qwen3_5ForConditionalGeneration"]
+            ),
+            has_asymmetric_kv=False,
+            has_attention_sinks=False,
+        )
+        return base_module.get_default_attn_backend(
+            SimpleNamespace(**args), use_mla_backend=False, model_config=model_config
+        )
+
+    def test_sm100_dflash_selects_trtllm_mha_before_topk_resolves(self):
+        with override_platform(
+            is_sm100=True, is_hopper_with_cuda_12_3=False, has_flashinfer=True
+        ):
+            self.assertEqual(self._backend(), "trtllm_mha")
+            # DFLASH's topk is still unset here; it can only ever become 1.
+            self.assertEqual(
+                self._backend(speculative_algorithm="DFLASH"), "trtllm_mha"
+            )
+            # EAGLE may still auto-tune topk > 1, so it needs an explicit value.
+            self.assertEqual(self._backend(speculative_algorithm="EAGLE"), "flashinfer")
+            self.assertEqual(
+                self._backend(speculative_algorithm="EAGLE", speculative_eagle_topk=1),
+                "trtllm_mha",
+            )
+
+
 class TestDeclarationValidation(CustomTestCase):
     def test_declarations_never_mutate_server_args(self):
         args = _FakeArgs()

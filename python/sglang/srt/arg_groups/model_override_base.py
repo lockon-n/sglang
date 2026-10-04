@@ -285,6 +285,9 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
             and (
                 cfg.speculative_algorithm is None
                 or cfg.speculative_eagle_topk is not None
+                # DFLASH always resolves topk to 1, but only in the speculative
+                # pass that runs after this one; don't wait for the value.
+                or (cfg.speculative_algorithm or "").upper() == "DFLASH"
             )
         ):
             # trtllm_mha requires equal K/V row widths; fa4 carries
