@@ -1169,6 +1169,9 @@ class Req(ReqDllmMixin):
         self.mm_image_tokens: int = 0
         self.mm_audio_tokens: int = 0
         self.mm_video_tokens: int = 0
+        # (image, audio, video) prompt tokens this request itself adds, counted
+        # on arrival; a session request also holds the earlier turns' items.
+        self.mm_new_token_counts: Optional[Tuple[int, int, int]] = None
 
         # Prefix info
         # The indices to kv cache for the shared prefix.

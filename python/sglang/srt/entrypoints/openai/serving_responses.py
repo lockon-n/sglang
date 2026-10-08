@@ -59,7 +59,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     Function,
     MessageProcessingResult,
-    PromptTokenUsageInfo,
+    PromptTokensDetails,
     RequestResponseMetadata,
     ResponseOutputMessage,
     ResponsesRequest,
@@ -838,6 +838,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         status = "completed"
         finish_reason = None
+        num_image_tokens = 0
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
             output = (
@@ -884,6 +885,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_generated_tokens = meta_info.get("completion_tokens", 0)
                 num_cached_tokens = meta_info.get("cached_tokens", 0)
                 num_reasoning_tokens = meta_info.get("reasoning_tokens", 0)
+                num_image_tokens = meta_info.get("image_tokens", 0)
                 finish_reason = meta_info.get("finish_reason")
                 status = self._status_from_finish_reason(finish_reason)
             elif isinstance(final_res, dict) and (
@@ -921,10 +923,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             total_tokens=num_prompt_tokens + num_generated_tokens,
             reasoning_tokens=num_reasoning_tokens,
         )
-        if self.enable_prompt_tokens_details and num_cached_tokens:
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=num_cached_tokens
-            )
+        usage.prompt_tokens_details = self._prompt_tokens_details(
+            num_cached_tokens, num_image_tokens
+        )
         request_metadata.final_usage_info = usage
 
         response = ResponsesResponse.from_request(
@@ -1016,6 +1017,17 @@ class OpenAIServingResponses(OpenAIServingChat):
             name=name,
             id=f"fc_{random_uuid()[:8]}",
             status="completed",
+        )
+
+    def _prompt_tokens_details(
+        self, cached_tokens: int, image_tokens: int
+    ) -> Optional[PromptTokensDetails]:
+        """Cached tokens (when reported) and the image tokens this request added."""
+        cached = cached_tokens if self.enable_prompt_tokens_details else 0
+        if not cached and not image_tokens:
+            return None
+        return PromptTokensDetails(
+            cached_tokens=cached or 0, image_tokens=image_tokens or None
         )
 
     @staticmethod
@@ -2138,6 +2150,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         prompt_tokens = 0
         completion_tokens = 0
         cached_tokens = 0
+        image_tokens = 0
         total_tokens_meta = 0
         reasoning_tokens_meta = 0
         finish_reason: Optional[dict[str, Any]] = None
@@ -2371,6 +2384,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 prompt_tokens = meta.get("prompt_tokens", prompt_tokens)
                 completion_tokens = meta.get("completion_tokens", completion_tokens)
                 cached_tokens = meta.get("cached_tokens", cached_tokens)
+                image_tokens = meta.get("image_tokens", image_tokens)
                 total_tokens_meta = meta.get("total_tokens", total_tokens_meta)
                 reasoning_tokens_meta = meta.get(
                     "reasoning_tokens", reasoning_tokens_meta
@@ -2704,10 +2718,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             total_tokens=total_tokens_meta or (prompt_tokens + completion_tokens),
             reasoning_tokens=reasoning_tokens_meta,
         )
-        if self.enable_prompt_tokens_details and cached_tokens:
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=cached_tokens
-            )
+        usage.prompt_tokens_details = self._prompt_tokens_details(
+            cached_tokens, image_tokens
+        )
         request_metadata.final_usage_info = usage
 
         final_response = ResponsesResponse.from_request(

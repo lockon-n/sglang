@@ -2987,6 +2987,7 @@ class Scheduler(
             return
 
         # Handle multimodal inputs
+        req.mm_new_token_counts = (0, 0, 0)
         if recv_req.mm_inputs is not None:
             try:
                 image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
@@ -3000,6 +3001,7 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+            req.mm_new_token_counts = image_inputs.compute_mm_token_counts()
             SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
 
             # The following steps are already fast, execute locally on each rank.

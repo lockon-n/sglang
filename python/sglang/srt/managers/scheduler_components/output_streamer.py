@@ -504,6 +504,8 @@ class _GenerationStreamAccumulator:
             image_t = req.mm_image_tokens
             audio_t = req.mm_audio_tokens
             video_t = req.mm_video_tokens
+        elif getattr(req, "mm_new_token_counts", None) is not None:
+            image_t, audio_t, video_t = req.mm_new_token_counts
         elif req.multimodal_inputs:
             image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
         else:

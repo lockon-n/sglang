@@ -337,6 +337,29 @@ class ResponsesResponseFromRequestTestCase(CustomTestCase):
         # Chat-style keys must be gone.
         self.assertNotIn("prompt_tokens", usage)
         self.assertNotIn("completion_tokens", usage)
+        self.assertNotIn("image_tokens", usage["input_tokens_details"])
+
+    def test_usage_reports_image_tokens_when_present(self):
+        request = ResponsesRequest(model="x", input="hi", store=False)
+        resp = ResponsesResponse.from_request(
+            request,
+            sampling_params={},
+            model_name="x",
+            created_time=0,
+            output=[],
+            status="completed",
+            usage=UsageInfo(
+                prompt_tokens=300,
+                completion_tokens=2,
+                total_tokens=302,
+                prompt_tokens_details=PromptTokensDetails(
+                    cached_tokens=0, image_tokens=256
+                ),
+            ),
+        )
+        details = resp.model_dump()["usage"]["input_tokens_details"]
+        self.assertEqual(details["image_tokens"], 256)
+        self.assertEqual(details["cached_tokens"], 0)
 
     def test_only_sdk_known_efforts_echoed_so_streaming_event_validates(self):
         import openai.types.responses as ort

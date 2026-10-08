@@ -2136,18 +2136,18 @@ class ResponsesResponse(BaseModel):
         """Emit the Responses usage shape, not the chat one UsageInfo carries."""
         if usage is None:
             return None
-        cached = (
-            usage.prompt_tokens_details.cached_tokens
-            if usage.prompt_tokens_details
-            else 0
-        )
+        details = usage.prompt_tokens_details
+        input_details = {
+            "cached_tokens": details.cached_tokens if details else 0,
+            # required (no default) in the SDK's InputTokensDetails model
+            "cache_write_tokens": 0,
+        }
+        # Image tokens this request added (only the new turn in a session chain).
+        if getattr(details, "image_tokens", None):
+            input_details["image_tokens"] = details.image_tokens
         return {
             "input_tokens": usage.prompt_tokens,
-            "input_tokens_details": {
-                "cached_tokens": cached,
-                # required (no default) in the SDK's InputTokensDetails model
-                "cache_write_tokens": 0,
-            },
+            "input_tokens_details": input_details,
             "output_tokens": usage.completion_tokens or 0,
             "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
             "total_tokens": usage.total_tokens,
