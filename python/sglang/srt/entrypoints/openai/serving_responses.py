@@ -1472,6 +1472,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                     # A replayed reasoning item has no phase and opens the
                     # message after it, so it takes that message's phase.
                     or merged[-1].keys() <= {"role", "reasoning_content"}
+                    # A function_call item has no phase and closes the
+                    # message the model wrote before it in the same turn.
+                    or msg.keys() <= {"role", "tool_calls"}
                 )
             ):
                 prev = merged[-1] = dict(merged[-1])

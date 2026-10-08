@@ -314,6 +314,44 @@ class InputMessageConstructionTestCase(CustomTestCase):
         self.assertEqual(messages[1]["content"], "answer")
         self.assertEqual(messages[1]["phase"], "final_answer")
 
+    def test_replay_merges_tool_calls_into_the_message_before_them(self):
+        # Text plus a call in one turn must replay as the single assistant
+        # block the model generated, not as a text block plus a call block.
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "working", "phase": "commentary"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "press",
+                    "arguments": '{"keys": ["up"]}',
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "press",
+                    "arguments": "{}",
+                },
+            ],
+            store=False,
+        )
+        messages = serving._construct_input_messages(request)
+        self.assertEqual(
+            [m["role"] for m in messages], ["user", "assistant", "tool", "assistant"]
+        )
+        self.assertEqual(messages[1]["content"], "working")
+        self.assertEqual(messages[1]["phase"], "commentary")
+        self.assertEqual(
+            [c["id"] for c in messages[1]["tool_calls"]], ["call_1"]
+        )
+        # A call-only turn stays its own message.
+        self.assertNotIn("content", messages[3])
+        self.assertEqual([c["id"] for c in messages[3]["tool_calls"]], ["call_2"])
+
     def test_input_parts_normalized_for_chat_templates(self):
         serving = make_serving()
         request = ResponsesRequest(
