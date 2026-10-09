@@ -234,6 +234,12 @@ class ResponsesSessionManager:
             )
         return sparse_blocks.config_for(request)
 
+    def request_i_frame(self, session_id: str) -> None:
+        """Encode the session's next image as a whole I frame."""
+        sparse_blocks = self._sparse_blocks()
+        if sparse_blocks is not None and sparse_blocks.is_open(session_id):
+            sparse_blocks.request_i_frame(session_id)
+
     def _sparse_blocks(self):
         """The chain image state of --enable-responses-sparse-blocks, if on."""
         mm_processor = getattr(self._tokenizer_manager, "mm_processor", None)

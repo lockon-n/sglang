@@ -726,13 +726,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                     "store=true, no background mode and no video or audio."
                 )
             return None
-        return await self.session_manager.begin_turn(
+        turn = await self.session_manager.begin_turn(
             previous_response_id=request.previous_response_id,
             prompt=engine_prompt,
             image_data=processed_messages.image_data,
             modalities=processed_messages.modalities,
             sparse_blocks=request.sparse_blocks,
         )
+        if turn is not None and request.sparse_i_frame:
+            self.session_manager.request_i_frame(turn.session_id)
+        return turn
 
     async def _make_request(
         self,

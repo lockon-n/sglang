@@ -201,6 +201,7 @@ class SparseBlockEncoder:
         self._std = torch.tensor(image_std, dtype=torch.float32).view(3, 1, 1)
         self._committed: dict[str, _ChainFrames] = {}
         self._staged: dict[str, _ChainFrames] = {}
+        self._i_frame_requested: set[str] = set()
 
     def config_for(self, request: Union[bool, dict]) -> SparseBlockConfig:
         """A request's ``sparse_blocks``: true for the defaults, or field overrides."""
@@ -228,18 +229,34 @@ class SparseBlockEncoder:
     def close(self, session_id: str) -> None:
         self._committed.pop(session_id, None)
         self._staged.pop(session_id, None)
+        self._i_frame_requested.discard(session_id)
+
+    def request_i_frame(self, session_id: str) -> None:
+        """Encode the last image of the chain's next turn with images whole, as
+        an I frame: later P frames are taken against it and the P run restarts
+        from it."""
+        self._i_frame_requested.add(session_id)
 
     def encode(self, session_id: str, images: list[torch.Tensor]) -> list[SparseFrame]:
         """Encode a turn's resized images ([3, H, W] in [0, 1]) in order."""
         state = dataclasses.replace(self._committed[session_id])
-        frames = [self._encode_one(state, image) for image in images]
+        force_last = bool(images) and session_id in self._i_frame_requested
+        if force_last:
+            self._i_frame_requested.discard(session_id)
+        frames = [
+            self._encode_one(state, image, force_i=force_last and k == len(images) - 1)
+            for k, image in enumerate(images)
+        ]
         self._staged[session_id] = state
         return frames
 
-    def _encode_one(self, state: _ChainFrames, current: torch.Tensor) -> SparseFrame:
+    def _encode_one(
+        self, state: _ChainFrames, current: torch.Tensor, force_i: bool = False
+    ) -> SparseFrame:
         config, previous = state.config, state.previous
         is_i = (
-            previous is None
+            force_i
+            or previous is None
             or previous.shape != current.shape
             or (
                 config.max_consecutive_p_frames >= 0

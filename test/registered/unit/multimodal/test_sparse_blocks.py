@@ -148,6 +148,22 @@ class TestEncoder(CustomTestCase):
             expected = _dense_patchify((torch.stack(pair) - 0.5) / 0.5)[rows]
             self.assertTrue(torch.allclose(frame.pixel_rows, expected), mode)
 
+    def test_requested_i_frame_anchors_a_new_p_run(self):
+        self._turn(self.image)
+        changed = _with_changed_blocks(self.image, [5], cols=8)
+        (p,) = self._turn(changed)  # one P frame into the run of 2
+        self.assertFalse(p.is_i_frame)
+        self.encoder.request_i_frame("chain")
+        self.assertEqual(self._turn(), [])  # a turn without images keeps the request
+        # The turn's last image is the forced one; earlier ones stay P frames.
+        before, forced = self._turn(changed, changed)
+        self.assertFalse(before.is_i_frame)
+        self.assertEqual((forced.is_i_frame, forced.num_tokens), (True, 32))
+        # The P run restarts at the forced frame, and the request is used once:
+        # two P frames follow before the run limit forces the next I frame.
+        first, second, limit = self._turn(changed, changed, changed)
+        self.assertEqual((first.is_i_frame, second.is_i_frame, limit.is_i_frame), (False, False, True))
+
     def test_scene_change_and_new_size_are_i_frames(self):
         self._turn(self.image)
         (cut,) = self._turn(1 - self.image)

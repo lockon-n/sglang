@@ -1824,6 +1824,12 @@ class ResponsesRequest(BaseModel):
         'SparseBlockConfig fields (e.g. {"p_frame_pair": "current"}). Needs '
         "--enable-responses-sparse-blocks; set when the chain's session opens.",
     )
+    sparse_i_frame: Optional[bool] = Field(
+        default=None,
+        description="In a sparse_blocks chain, encode this turn's last image "
+        "whole, as an I frame: the chain's next P frames are taken against it. "
+        "Not part of the chain's config, so it does not reopen the session.",
+    )
     request_id: str = Field(
         default_factory=lambda: f"resp_{uuid.uuid4().hex}",
         description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
