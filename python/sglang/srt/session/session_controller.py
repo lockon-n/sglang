@@ -16,7 +16,7 @@ import logging
 import time
 import uuid
 from array import array
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Callable, Dict, Optional
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
@@ -96,6 +96,11 @@ class Session:
         self.req_nodes: Dict[str, SessionReqNode] = {}
         self.close_on_finish: bool = False
         self._inflight: bool = False
+        # The request that set _inflight, when, and how many reaps in a row
+        # found it nowhere in the scheduler (see SessionController.maybe_reap).
+        self._inflight_rid: Optional[str] = None
+        self._inflight_since: float = 0.0
+        self._absent_reaps: int = 0
         # Token-array lengths of last_req as of its finish_req. The share path
         # appends speculatively beyond these; only finish_req confirms them, so
         # _share_token_arrays trims back first (heals aborted turns).
@@ -342,6 +347,9 @@ class Session:
             self.last_active_time = time.monotonic()
             # req_nodes is NOT updated here — finish_req() handles it.
             self._inflight = True
+            self._inflight_rid = new_req.rid
+            self._inflight_since = time.monotonic()
+            self._absent_reaps = 0
         else:
             self.last_active_time = time.monotonic()
             new_req_node = SessionReqNode(new_req, last_req_node)
@@ -352,6 +360,7 @@ class Session:
     def finish_req(self, req):
         """Update req_nodes after a streaming request finishes successfully."""
         self._inflight = False
+        self._inflight_rid = None
         if self.req_nodes:
             [prev_node] = self.req_nodes.values()
             prev_node.req.session = None
@@ -365,11 +374,15 @@ class Session:
     def abort_req(self):
         """Clear inflight flag on abort (req_nodes stays unchanged)."""
         self._inflight = False
+        self._inflight_rid = None
 
 
 class SessionController:
     def __init__(self, tree_cache: BasePrefixCache):
         self.sessions: Dict[str, Session] = {}
+        # Set by the scheduler: where it holds a request ("waiting", "running",
+        # ...), or None if it holds it nowhere.
+        self.locate_req: Optional[Callable[[str], Optional[str]]] = None
         self._last_reap_time: float = 0.0
         self.tree_cache = tree_cache
 
@@ -425,11 +438,17 @@ class SessionController:
             # session for deferred cleanup: the request keeps its session
             # reference so release_kv_cache takes the streaming path,
             # and we schedule release_session for after it completes.
+            first = not session.close_on_finish
             session.close_on_finish = True
-            logger.info(
-                "Deferring session close for %s (unfinished request)",
-                session_id,
-            )
+            if first:
+                logger.info(
+                    "Deferring session close for %s (unfinished request %s, "
+                    "in flight for %.1fs, held by the scheduler as: %s)",
+                    session_id,
+                    session._inflight_rid,
+                    time.monotonic() - session._inflight_since,
+                    self._where(session._inflight_rid),
+                )
             return
 
         # No owning request -- safe to release immediately.
@@ -460,6 +479,8 @@ class SessionController:
         if now - self._last_reap_time > interval:
             self._last_reap_time = now
 
+            self._release_orphaned_sessions()
+
             # Finish deferred closes for sessions whose requests completed.
             pending = [
                 sid
@@ -480,6 +501,42 @@ class SessionController:
             for sid in timed_out:
                 log_info_on_rank0(logger, f"Session {sid} timed out, closing.")
                 self._close(sid)
+
+    def _where(self, rid: Optional[str]) -> Optional[str]:
+        if rid is None or self.locate_req is None:
+            return "unknown"
+        return self.locate_req(rid)
+
+    def _release_orphaned_sessions(self):
+        """Close sessions whose in-flight request the scheduler no longer holds.
+
+        A request that leaves the scheduler without finish_req or abort_req
+        would keep its session's _inflight set forever: the deferred close
+        never completes and the session holds its KV and mamba slot for good.
+        A session closing on a request found nowhere in two reaps in a row is
+        released as if that request had aborted.
+        """
+        if self.locate_req is None:
+            return
+        for sid, session in list(self.sessions.items()):
+            if not (session.close_on_finish and session._inflight):
+                continue
+            if self.locate_req(session._inflight_rid) is not None:
+                session._absent_reaps = 0
+                continue
+            session._absent_reaps += 1
+            if session._absent_reaps < 2:
+                continue
+            logger.warning(
+                "Session %s waited %.1fs on request %s, which the scheduler no "
+                "longer holds; releasing the session.",
+                sid,
+                time.monotonic() - session._inflight_since,
+                session._inflight_rid,
+            )
+            session.abort_req()
+            session.close_on_finish = False
+            self._close(sid)
 
     @staticmethod
     def _all_requests_finished(session: Session) -> bool:

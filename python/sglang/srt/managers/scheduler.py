@@ -1299,6 +1299,7 @@ class Scheduler(
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
+        self.session_controller.locate_req = self._locate_req
         self.forward_sleep_time = None
         self._engine_paused = False
 
@@ -5436,6 +5437,19 @@ class Scheduler(
         logger.info(
             f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"
         )
+
+    def _locate_req(self, rid: str) -> Optional[str]:
+        """Where the scheduler holds request `rid`, or None if nowhere."""
+        if any(r.rid == rid for r in self.waiting_queue):
+            return "waiting"
+        if self.chunked_req is not None and self.chunked_req.rid == rid:
+            return "chunked"
+        for name, batch in (("running", self.running_batch), ("last", self.last_batch)):
+            if batch is not None and any(r.rid == rid for r in batch.reqs):
+                return name
+        if any(r.rid == rid for r in self.grammar_manager.grammar_queue):
+            return "grammar"
+        return None
 
     def collect_inflight_reqs(self) -> Set[Req]:
         if get_parallel().pp_size == 1:
